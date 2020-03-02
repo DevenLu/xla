@@ -25,7 +25,7 @@ NodePtr DeviceData::Clone(OpList operands) const {
 }
 
 XlaOpVector DeviceData::Lower(LoweringContext* loctx) const {
-  return ReturnOp(loctx->GetParameter(data_), loctx);
+  return ReturnOp(loctx->GetParameter(this, data_), loctx);
 }
 
 DeviceData* DeviceData::Cast(const Node* node) {

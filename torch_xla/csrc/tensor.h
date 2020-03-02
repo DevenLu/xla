@@ -17,13 +17,13 @@
 #include "torch_xla/csrc/cross_replica_reduces.h"
 #include "torch_xla/csrc/device.h"
 #include "torch_xla/csrc/ir.h"
+#include "torch_xla/csrc/lowering_context.h"
 #include "torch_xla/csrc/view.h"
 
 namespace torch_xla {
 
 class XLATensor {
   class DeviceContextArena;
-  class IrNodeMetaData;
   struct Data;
 
  public:
@@ -1122,6 +1122,8 @@ class XLATensor {
 
   void SetTensorData(at::Tensor tensor_data);
 
+  ir::Value CreateTensorNode(xla::ComputationClient::DataPtr data) const;
+
   View::IrNode GetViewUpdate(const std::shared_ptr<View>& view) const;
 
   std::shared_ptr<View> UpdateView(std::shared_ptr<View> view,
@@ -1154,8 +1156,8 @@ class XLATensor {
 
   std::vector<XLATensor> MakeOutputTensors(ir::NodePtr node) const;
 
-  static ir::Value GetIrValueForTensor(const at::Tensor& tensor,
-                                       const Device& device);
+  ir::Value GetIrValueForTensor(const at::Tensor& tensor,
+                                const Device& device) const;
 
   static ComputationCache* GetComputationCache();
 
@@ -1216,6 +1218,10 @@ class XLATensor {
       std::vector<XLATensor>* tensors, const SyncTensorsConfig& config,
       SyncTensorCollection* coll);
 
+  static void BuildInputOutputAliases(const std::vector<XLATensor>& tensors,
+                                      absl::Span<const size_t> indices,
+                                      ir::LoweringContext* lowering_ctx);
+
   static CompilationResult Compile(const std::vector<XLATensor>& tensors,
                                    absl::Span<const std::string> devices,
                                    const SyncTensorCollection& coll);
@@ -1223,8 +1229,6 @@ class XLATensor {
   static std::shared_ptr<Async> SyncTensorsGraphInternal(
       std::vector<XLATensor>* tensors, absl::Span<const std::string> devices,
       const SyncTensorsConfig& config);
-
-  static ir::Value CreateTensorNode(xla::ComputationClient::DataPtr data);
 
   static xla::int64 GetNextTensorId();
 

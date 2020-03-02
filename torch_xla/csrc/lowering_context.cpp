@@ -59,7 +59,7 @@ class HloMetadataSetter {
 
 }  // namespace
 
-xla::XlaOp LoweringContext::GetParameter(
+xla::XlaOp LoweringContext::GetParameter(const Node* node,
     const std::shared_ptr<xla::ComputationClient::Data>& data) {
   xla::ComputationClient::Data::OpaqueHandle handle = data->GetOpaqueHandle();
   auto it = parameters_map_.find(handle);
@@ -68,9 +68,23 @@ xla::XlaOp LoweringContext::GetParameter(
         xla::Parameter(builder(), parameters_.size(), data->shape(),
                        absl::StrCat("p", parameters_.size()));
     parameters_.push_back(data);
+    parameters_nodes_.push_back(node);
     it = parameters_map_.emplace(handle, param).first;
   }
   return it->second;
+}
+
+bool LoweringContext::CanAliasParameter(size_t param_no) const {
+  // A parameter can be aliased only if all its uses are within the current
+  // execution graph.
+  const Node* param_node = parameters_nodes_.at(param_no);
+  for (auto& use : param_node->uses()) {
+    auto it = emitted_outputs_.find(Output(use.node));
+    if (it == emitted_outputs_.end()) {
+      return false;
+    }
+  }
+  return true;
 }
 
 xla::int64 LoweringContext::AddResult(xla::XlaOp op) {

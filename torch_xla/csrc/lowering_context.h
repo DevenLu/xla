@@ -26,7 +26,7 @@ class LoweringContext {
   // If a parameter associated with data has already been declared, it will be
   // returned. Otherwise a new one will be created, associated with the tensor
   // held in data.
-  xla::XlaOp GetParameter(
+  xla::XlaOp GetParameter(const Node* node,
       const std::shared_ptr<xla::ComputationClient::Data>& data);
 
   // Retrieves the vector holding all the tensors associated with the parameter
@@ -35,6 +35,8 @@ class LoweringContext {
       const {
     return parameters_;
   }
+
+  bool CanAliasParameter(size_t param_no) const;
 
   // Adds the output of a given operation to the result tuple.
   xla::int64 AddResult(xla::XlaOp op);
@@ -72,6 +74,7 @@ class LoweringContext {
 
   xla::XlaBuilder builder_;
   std::vector<xla::ComputationClient::DataPtr> parameters_;
+  std::vector<const Node*> parameters_nodes_;
   std::unordered_map<xla::ComputationClient::Data::OpaqueHandle, xla::XlaOp>
       parameters_map_;
   std::vector<xla::XlaOp> root_tuple_;

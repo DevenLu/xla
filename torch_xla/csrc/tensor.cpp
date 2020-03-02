@@ -28,8 +28,8 @@
 #include "torch_xla/csrc/ir_dump_util.h"
 #include "torch_xla/csrc/ir_util.h"
 #include "torch_xla/csrc/layout_manager.h"
-#include "torch_xla/csrc/lowering_context.h"
 #include "torch_xla/csrc/op_by_op_executor.h"
+#include "torch_xla/csrc/ops/device_data.h"
 #include "torch_xla/csrc/ops/expand.h"
 #include "torch_xla/csrc/ops/ops.h"
 #include "torch_xla/csrc/ops/view.h"
@@ -337,27 +337,10 @@ class XLATensor::DeviceContextArena {
   std::map<Device, DeviceContext*> device_contexts_;
 };
 
-class XLATensor::IrNodeMetaData : public ir::UserMetaData {
- public:
-  void BindTensorData(std::shared_ptr<Data> data) {
-    tensors_data_.emplace(data->unique_id, data);
-  }
+struct DeviceDataInfo : public xla::ComputationClient::Data::Info {
+  explicit DeviceDataInfo(xla::int64 tensor_id) : tensor_id(tensor_id) {}
 
-  void UnbindTensorData(Data* data) { tensors_data_.erase(data->unique_id); }
-
-  std::vector<std::shared_ptr<Data>> GetBoundTensorData() const {
-    std::vector<std::shared_ptr<Data>> tensors_data;
-    for (auto& uid_wptr : tensors_data_) {
-      std::shared_ptr<Data> data = uid_wptr.second.lock();
-      if (data != nullptr) {
-        tensors_data.push_back(std::move(data));
-      }
-    }
-    return tensors_data;
-  }
-
- private:
-  std::map<xla::int64, std::weak_ptr<Data>> tensors_data_;
+  xla::int64 tensor_id = 0;
 };
 
 XLATensor::Data::~Data() { DeviceContextArena::Get()->UnregisterTensor(this); }
@@ -440,11 +423,6 @@ XLATensor::XLATensor(ir::Value ir_value, const Device& device,
                      c10::optional<at::ScalarType> logical_element_type)
     : data_(std::make_shared<Data>(std::move(ir_value), device,
                                    logical_element_type)) {
-  // This can't be in the Data constructor, as binding wants an
-  // std::shared_ptr<Data>, since the metadata holds std::weak_ptr<Data> (can't
-  // hold shared pointers as it'd fall into circular refcounting).
-  data()->ir_value->get_user_metadata<IrNodeMetaData>()->BindTensorData(
-      data_ptr());
   TryLimitGraphSize();
 }
 
@@ -590,17 +568,6 @@ void XLATensor::SetIrValue(ir::Value ir_value) {
 }
 
 void XLATensor::AssignIrValue(ir::Value ir_value) const {
-  ir::Value prev_ir_value = data()->ir_value;
-  if (prev_ir_value) {
-    IrNodeMetaData* meta = prev_ir_value->user_metadata<IrNodeMetaData>();
-    // If there is a current IR value, it must have IrNodeMetaData as we should
-    // have previously registered it.
-    XLA_CHECK(meta != nullptr);
-    meta->UnbindTensorData(data());
-  }
-  if (ir_value) {
-    ir_value->get_user_metadata<IrNodeMetaData>()->BindTensorData(data_ptr());
-  }
   data()->ir_value = std::move(ir_value);
   data()->generation += 1;
 }
@@ -660,7 +627,7 @@ c10::optional<at::Tensor> XLATensor::CurrentTensorData() const {
 }
 
 ir::Value XLATensor::GetIrValueForTensor(const at::Tensor& tensor,
-                                         const Device& device) {
+                                         const Device& device) const {
   xla::ComputationClient::DataPtr data;
   if (tensor.dim() == 0 && tensor.numel() == 1) {
     at::Scalar value = tensor.item();
@@ -674,7 +641,7 @@ ir::Value XLATensor::GetIrValueForTensor(const at::Tensor& tensor,
     XLA_TIMED("IrValueTensorToXlaData");
     data = TensorToXlaData(tensor, device);
   }
-  return ir::MakeNode<ir::ops::DeviceData>(std::move(data));
+  return CreateTensorNode(std::move(data));
 }
 
 ir::Value XLATensor::GetIrValueForScalar(at::Scalar value,
@@ -924,8 +891,10 @@ std::vector<XLATensor> XLATensor::CreateTensors(
   return xla_tensors;
 }
 
-ir::Value XLATensor::CreateTensorNode(xla::ComputationClient::DataPtr data) {
-  return ir::ops::DeviceDataOp(std::move(data));
+ir::Value XLATensor::CreateTensorNode(
+    xla::ComputationClient::DataPtr data) const {
+  data->SetInfo(std::make_shared<DeviceDataInfo>(GetUniqueId()));
+  return ir::MakeNode<ir::ops::DeviceData>(std::move(data));
 }
 
 xla::int64 XLATensor::GetNextTensorId() {
@@ -1331,9 +1300,45 @@ XLATensor::OpByOpAsync XLATensor::SyncTensorsGraphOpByOp(
   return async_op.Schedule();
 }
 
+void XLATensor::BuildInputOutputAliases(const std::vector<XLATensor>& tensors,
+                                        absl::Span<const size_t> indices,
+                                        ir::LoweringContext* lowering_ctx) {
+  std::unordered_map<xla::int64, size_t> output_tensor_id_map;
+  for (size_t i = 0; i < indices.size(); ++i) {
+    size_t tensor_index = indices[i];
+    xla::int64 tensor_id = tensors[tensor_index].GetUniqueId();
+    output_tensor_id_map[tensor_id] = i;
+  }
+  const std::vector<xla::ComputationClient::DataPtr>& parameters_data =
+      lowering_ctx->GetParametersData();
+  std::vector<ssize_t> alias_map(indices.size(), -1);
+  for (size_t i = 0; i < parameters_data.size(); ++i) {
+    DeviceDataInfo* data_info =
+        dynamic_cast<DeviceDataInfo*>(parameters_data[i]->info());
+    if (data_info != nullptr && lowering_ctx->CanAliasParameter(i)) {
+      auto it = output_tensor_id_map.find(data_info->tensor_id);
+      if (it != output_tensor_id_map.end()) {
+        size_t output_index = it->second;
+        size_t tensor_index = indices[output_index];
+        if (parameters_data[i]->shape() == tensors[tensor_index].shape() &&
+            alias_map[output_index] < 0) {
+          lowering_ctx->builder()->SetUpAlias(
+              {static_cast<xla::int64>(output_index)}, i, {});
+          alias_map[output_index] = i;
+
+          TF_VLOG(6) << "Aliased paramter " << i << " with output "
+                     << output_index << ": " << parameters_data[i]->shape();
+        }
+      }
+    }
+  }
+}
+
 XLATensor::CompilationResult XLATensor::Compile(
     const std::vector<XLATensor>& tensors,
     absl::Span<const std::string> devices, const SyncTensorCollection& coll) {
+  static const bool enable_aliasing =
+      xla::sys_util::GetEnvBool("XLA_ENABLE_PARAM_ALIASING", true);
   xla::util::Unique<Device> unique_device;
   ir::LoweringContext lowering_ctx("SyncTensorsGraph");
   for (auto index : coll.indices) {
@@ -1342,6 +1347,10 @@ XLATensor::CompilationResult XLATensor::Compile(
     lowering_ctx.AddResult(root);
     unique_device.set(tensors[index].GetDevice());
   }
+  if (enable_aliasing) {
+    BuildInputOutputAliases(tensors, coll.indices, &lowering_ctx);
+  }
+
   xla::XlaComputation computation = ConsumeValue(lowering_ctx.Build());
   xla::ProgramShape program_shape = ConsumeValue(computation.GetProgramShape());
   xla::Shape shape =
